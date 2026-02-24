@@ -1,14 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useRouter } from 'next/router';
-import io, { Socket } from 'socket.io-client';
+import Pusher from 'pusher-js';
 import YouTube from 'react-youtube';
 import { Camera, CameraOff, Mic, MicOff, Send, PlayCircle, PauseCircle, Heart } from 'lucide-react';
 import { extractYouTubeId } from '@/utils/extractYouTubeId';
 
-let socket: Socket;
-
-// Helper to generate random IDs for emojis
+// Helper to generate random IDs
 const generateId = () => Math.random().toString(36).substr(2, 9);
+const generateUserId = () => Math.random().toString(36).substr(2, 9);
 
 interface Reaction {
     id: string;
@@ -19,6 +18,9 @@ interface Reaction {
 export default function Room() {
     const router = useRouter();
     const { id: roomId } = router.query;
+
+    // Create strong unique ID for this client so we ignore our own Pusher events
+    const [userId] = useState(generateUserId());
 
     const [connected, setConnected] = useState(false);
     const [messages, setMessages] = useState<{ sender: string, text: string }[]>([]);
@@ -43,6 +45,20 @@ export default function Room() {
 
     // WebRTC ref
     const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+    const pusherRef = useRef<Pusher | null>(null);
+
+    const emitEvent = useCallback(async (eventName: string, data: any = {}) => {
+        if (!roomId) return;
+        await fetch('/api/pusher', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                event: eventName,
+                roomId,
+                data: { ...data, senderId: userId }
+            })
+        });
+    }, [roomId, userId]);
 
     useEffect(() => {
         // Save state helper
@@ -54,56 +70,36 @@ export default function Room() {
     }, [videoId, messages]);
 
     useEffect(() => {
-        socketInitializer();
-        return () => {
-            if (socket) socket.disconnect();
-            if (peerConnectionRef.current) {
-                peerConnectionRef.current.close();
-            }
-        };
-    }, []);
+        if (!roomId) return;
 
-    const initWebRTC = () => {
-        if (peerConnectionRef.current) return;
+        // Initialize Pusher Client
+        const pusher = new Pusher("a74526b2c362e9363d7f", {
+            cluster: "ap2",
+        });
+        pusherRef.current = pusher;
 
-        const pc = new RTCPeerConnection({
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:global.stun.twilio.com:3478' }
-            ]
+        const channel = pusher.subscribe(`room-${roomId}`);
+
+        channel.bind('receive-message', (data: any) => {
+            const isMe = data.senderId === userId;
+            setMessages(prev => [...prev, { text: data.text, sender: isMe ? 'You' : 'Main' }]);
+            if (!isMe && !connected) setConnected(true);
         });
 
-        pc.onicecandidate = (event) => {
-            if (event.candidate && socket) {
-                socket.emit('webrtc-ice-candidate', { roomId, candidate: event.candidate });
+        channel.bind('video-change', (data: any) => {
+            if (data.senderId !== userId) {
+                setVideoId(data.videoId);
             }
-        };
-
-        pc.ontrack = (event) => {
-            if (remoteVideoRef.current && event.streams[0]) {
-                remoteVideoRef.current.srcObject = event.streams[0];
-            }
-        };
-
-        peerConnectionRef.current = pc;
-    };
-
-    const socketInitializer = async () => {
-        await fetch('/api/socket');
-        socket = io({ path: '/api/socket' });
-
-        socket.on('connect', () => {
-            setConnected(true);
-            if (roomId) socket.emit('join-room', roomId);
-            initWebRTC(); // ensure PC is ready
         });
 
-        socket.on('receive-message', (data) => setMessages((prev) => [...prev, data]));
-        socket.on('video-change', (data) => setVideoId(data.videoId));
-        socket.on('emoji-reaction', (data) => handleIncomingReaction(data.emoji));
+        channel.bind('emoji-reaction', (data: any) => {
+            if (data.senderId !== userId) {
+                handleIncomingReaction(data.emoji);
+            }
+        });
 
-        socket.on('video-state', (data) => {
-            if (!playerRef.current) return;
+        channel.bind('video-state', (data: any) => {
+            if (data.senderId === userId || !playerRef.current) return;
             const player = playerRef.current;
             if (data.type === 'play') {
                 setIsPlaying(true);
@@ -116,44 +112,102 @@ export default function Room() {
             }
         });
 
-        socket.on('webrtc-offer', async (data) => {
+        // WebRTC bindings
+        channel.bind('webrtc-offer', async (data: any) => {
+            if (data.senderId === userId) return;
             if (!peerConnectionRef.current) initWebRTC();
             const pc = peerConnectionRef.current!;
-            await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            socket.emit('webrtc-answer', { roomId, signal: answer });
+
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                emitEvent('webrtc-answer', { signal: answer });
+            } catch (err) {
+                console.error("Error handling offer:", err);
+            }
         });
 
-        socket.on('webrtc-answer', async (data) => {
-            if (!peerConnectionRef.current) return;
+        channel.bind('webrtc-answer', async (data: any) => {
+            if (data.senderId === userId || !peerConnectionRef.current) return;
             const pc = peerConnectionRef.current;
-            await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
+            try {
+                // Check signaling state to prevent InvalidStateError
+                if (pc.signalingState !== 'stable') {
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.signal));
+                    setConnected(true);
+                }
+            } catch (err) {
+                console.error("Error setting answer:", err);
+            }
         });
 
-        socket.on('webrtc-ice-candidate', async (data) => {
-            if (!peerConnectionRef.current) return;
+        channel.bind('webrtc-ice-candidate', async (data: any) => {
+            if (data.senderId === userId || !peerConnectionRef.current) return;
             try {
                 await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate));
             } catch (e) {
                 console.error("Error adding received ice candidate", e);
             }
         });
+
+        pusher.connection.bind('connected', () => {
+            // We are connected to pusher, but let's wait for peer interaction
+        });
+
+        initWebRTC(); // ensure PC is ready
+
+        return () => {
+            pusher.unsubscribe(`room-${roomId}`);
+            pusher.disconnect();
+            if (peerConnectionRef.current) {
+                peerConnectionRef.current.close();
+            }
+        };
+    }, [roomId, userId, emitEvent]);
+
+    const initWebRTC = () => {
+        if (peerConnectionRef.current) return;
+
+        const pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:global.stun.twilio.com:3478' }
+            ]
+        });
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                emitEvent('webrtc-ice-candidate', { candidate: event.candidate });
+            }
+        };
+
+        pc.ontrack = (event) => {
+            if (remoteVideoRef.current && event.streams[0]) {
+                remoteVideoRef.current.srcObject = event.streams[0];
+                setConnected(true);
+            }
+        };
+
+        peerConnectionRef.current = pc;
     };
 
     const makeCall = async () => {
         if (!peerConnectionRef.current) return;
         const pc = peerConnectionRef.current;
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit('webrtc-offer', { roomId, signal: offer });
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            emitEvent('webrtc-offer', { signal: offer });
+        } catch (err) {
+            console.error("makeCall error", err);
+        }
     };
 
     const handleSendMessage = (e: React.FormEvent) => {
         e.preventDefault();
         if (!chatInput.trim()) return;
-        const msg = { roomId, sender: 'You', text: chatInput };
-        socket.emit('send-message', msg);
+        emitEvent('receive-message', { text: chatInput });
         setChatInput('');
     };
 
@@ -162,7 +216,7 @@ export default function Room() {
         const extractedId = extractYouTubeId(videoLinkInput);
         if (extractedId) {
             setVideoId(extractedId);
-            socket.emit('video-change', { roomId, videoId: extractedId });
+            emitEvent('video-change', { videoId: extractedId });
             setVideoLinkInput('');
         } else {
             alert("Invalid YouTube link");
@@ -170,7 +224,7 @@ export default function Room() {
     };
 
     const triggerReaction = (emoji: string) => {
-        socket.emit('emoji-reaction', { roomId, emoji });
+        emitEvent('emoji-reaction', { emoji });
         handleIncomingReaction(emoji);
     };
 
@@ -191,6 +245,7 @@ export default function Room() {
 
             if (!useVideo && !useAudio) {
                 setLocalStream(null);
+                if (localVideoRef.current) localVideoRef.current.srcObject = null;
                 return;
             }
 
@@ -234,14 +289,14 @@ export default function Room() {
     const onPlay = () => {
         setIsPlaying(true);
         if (playerRef.current) {
-            socket.emit('video-state', { roomId, type: 'play', time: playerRef.current.getCurrentTime() });
+            emitEvent('video-state', { type: 'play', time: playerRef.current.getCurrentTime() });
         }
     };
 
     const onPause = () => {
         setIsPlaying(false);
         if (playerRef.current) {
-            socket.emit('video-state', { roomId, type: 'pause', time: playerRef.current.getCurrentTime() });
+            emitEvent('video-state', { type: 'pause', time: playerRef.current.getCurrentTime() });
         }
     };
 
@@ -320,10 +375,10 @@ export default function Room() {
                     {/* Controls Bar */}
                     <div className="glass-card p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4">
                         <div className="flex items-center gap-3">
-                            <button onClick={() => playerRef.current?.playVideo()} className="p-3 bg-blue-100 hover:bg-blue-200 text-blue-600 rounded-full transition-all hover:scale-105 shadow-sm" title="Play Server-Sync">
+                            <button onClick={onPlay} className="p-3 bg-blue-100 hover:bg-blue-200 text-blue-600 rounded-full transition-all hover:scale-105 shadow-sm" title="Play Server-Sync">
                                 <PlayCircle size={24} />
                             </button>
-                            <button onClick={() => playerRef.current?.pauseVideo()} className="p-3 bg-pink-100 hover:bg-pink-200 text-pink-600 rounded-full transition-all hover:scale-105 shadow-sm" title="Pause Server-Sync">
+                            <button onClick={onPause} className="p-3 bg-pink-100 hover:bg-pink-200 text-pink-600 rounded-full transition-all hover:scale-105 shadow-sm" title="Pause Server-Sync">
                                 <PauseCircle size={24} />
                             </button>
                             <span className="hidden sm:inline text-sm font-medium text-gray-500 ml-2">Sync Controls</span>
@@ -362,7 +417,9 @@ export default function Room() {
                         </div>
                         <div className="flex-1 bg-gray-900 rounded-2xl overflow-hidden glass-card relative border border-blue-200 shadow-md">
                             <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
-                            <span className="absolute bottom-2 left-2 text-xs bg-black/60 backdrop-blur-sm text-white px-2 py-1 rounded-md font-medium">Main</span>
+                            <span className="absolute bottom-2 left-2 text-xs bg-black/60 backdrop-blur-sm text-white px-2 py-1 rounded-md font-medium">
+                                {connected ? 'Main (Connected)' : 'Main'}
+                            </span>
                         </div>
                     </div>
 
