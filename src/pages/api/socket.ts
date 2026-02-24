@@ -65,6 +65,18 @@ export default function SocketHandler(req: NextApiRequest, res: NextApiResponseS
                     });
                 });
 
+                socket.on('webrtc-ice-candidate', (data) => {
+                    socket.to(data.roomId).emit('webrtc-ice-candidate', {
+                        candidate: data.candidate,
+                        senderId: socket.id
+                    });
+                });
+
+                // Emoji reactions
+                socket.on('emoji-reaction', (data) => {
+                    io.to(data.roomId).emit('emoji-reaction', data);
+                });
+
                 socket.on('disconnect', () => {
                     console.log('Client disconnected', socket.id);
                 });
